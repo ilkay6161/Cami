@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, redirect, url_for, jsonify, a
 import datetime
 import json
 import os
+import base64
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.utils import secure_filename
 import matplotlib.pyplot as plt
@@ -12,7 +13,7 @@ from collections import defaultdict
 from flask_moment import Moment
 from matplotlib.backends.backend_pdf import PdfPages
 from flask_migrate import Migrate
-from sqlalchemy import func
+from sqlalchemy import func, and_, or_
 
 #from weasyprint import HTML, CSS
 # App erstellen
@@ -161,8 +162,18 @@ class Klasse(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(50), nullable=False)
     schuljahr = db.Column(db.String(9), nullable=False)
+    klassenstufe = db.Column(db.Integer)  # z.B. 5, 6, 7, etc.
+    klassenlehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'))
+    raum = db.Column(db.String(20))
+    
+    # Relationships
     schueler = db.relationship('Schueler', backref='klasse', lazy=True)
     unterrichtseinheiten = db.relationship('Unterrichtseinheit', backref='klasse', lazy=True)
+    stundenplan = db.relationship('Stundenplan', backref='klasse', lazy=True)
+    vertretungen = db.relationship('Vertretung', backref='klasse', lazy=True)
+    hausaufgaben = db.relationship('Hausaufgabe', backref='klasse', lazy=True)
+    lernziele = db.relationship('Lernziel', backref='klasse', lazy=True)
+    pruefungen = db.relationship('Pruefung', backref='klasse', lazy=True)
 
 class Schueler(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -171,6 +182,22 @@ class Schueler(db.Model):
     geburtsdatum = db.Column(db.Date)
     geschlecht = db.Column(db.String(1))
     klasse_id = db.Column(db.Integer, db.ForeignKey('klasse.id'), nullable=False)
+    eltern_id = db.Column(db.Integer, db.ForeignKey('eltern.id'))
+    email = db.Column(db.String(120))
+    telefon = db.Column(db.String(20))
+    adresse = db.Column(db.Text)
+    eintrittsdatum = db.Column(db.Date)
+    austrittsdatum = db.Column(db.Date)
+    ist_aktiv = db.Column(db.Boolean, default=True)
+    
+    # Relationships
+    noten = db.relationship('Note', backref='schueler', lazy=True)
+    anwesenheiten = db.relationship('Anwesenheit', backref='schueler', lazy=True)
+    hausaufgaben_abgaben = db.relationship('HausaufgabenAbgabe', backref='schueler', lazy=True)
+    portfolios = db.relationship('Portfolio', backref='schueler', lazy=True)
+    verhaltensbewertungen = db.relationship('Verhaltensbewertung', backref='schueler', lazy=True)
+    pruefungs_ergebnisse = db.relationship('PruefungsErgebnis', backref='schueler', lazy=True)
+    lernziel_fortschritte = db.relationship('LernzielFortschritt', backref='schueler', lazy=True)
 
 class Unterrichtseinheit(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -180,6 +207,13 @@ class Unterrichtseinheit(db.Model):
     inhalte = db.Column(db.Text)
     bemerkung = db.Column(db.Text)
     klasse_id = db.Column(db.Integer, db.ForeignKey('klasse.id'), nullable=False)
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'), nullable=False)
+    lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'), nullable=False)
+    hausaufgabe = db.Column(db.Text)  # Kurze Hausaufgabe direkt im Unterricht
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    
+    # Relationships
+    anwesenheiten = db.relationship('Anwesenheit', backref='unterrichtseinheit', lazy=True)
 
 class Anwesenheit(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -187,6 +221,201 @@ class Anwesenheit(db.Model):
     unterrichtseinheit_id = db.Column(db.Integer, db.ForeignKey('unterrichtseinheit.id'), nullable=False)
     anwesend = db.Column(db.Boolean, default=False)
     entschuldigt = db.Column(db.Boolean, default=False)
+    verspaetet = db.Column(db.Boolean, default=False)
+    verspaetung_minuten = db.Column(db.Integer, default=0)
+
+# Erweiterte Modelle für vollständiges Klassenbuch
+
+class Fach(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    kuerzel = db.Column(db.String(10), nullable=False)
+    farbe = db.Column(db.String(7), default='#007bff')  # Hex-Farbe für UI
+    beschreibung = db.Column(db.Text)
+    unterrichtseinheiten = db.relationship('Unterrichtseinheit', backref='fach', lazy=True)
+    noten = db.relationship('Note', backref='fach', lazy=True)
+    hausaufgaben = db.relationship('Hausaufgabe', backref='fach', lazy=True)
+
+class Lehrer(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    kuerzel = db.Column(db.String(10), unique=True, nullable=False)
+    vorname = db.Column(db.String(50), nullable=False)
+    nachname = db.Column(db.String(50), nullable=False)
+    email = db.Column(db.String(120), nullable=False)
+    telefon = db.Column(db.String(20))
+    faecher = db.relationship('Fach', secondary='lehrer_fach', backref=db.backref('lehrer', lazy='dynamic'))
+    klassen = db.relationship('Klasse', secondary='lehrer_klasse', backref=db.backref('lehrer', lazy='dynamic'))
+
+# Zuordnungstabellen für Many-to-Many Beziehungen
+lehrer_fach = db.Table('lehrer_fach',
+    db.Column('lehrer_id', db.Integer, db.ForeignKey('lehrer.id'), primary_key=True),
+    db.Column('fach_id', db.Integer, db.ForeignKey('fach.id'), primary_key=True)
+)
+
+lehrer_klasse = db.Table('lehrer_klasse',
+    db.Column('lehrer_id', db.Integer, db.ForeignKey('lehrer.id'), primary_key=True),
+    db.Column('klasse_id', db.Integer, db.ForeignKey('klasse.id'), primary_key=True)
+)
+
+class Stundenplan(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    klasse_id = db.Column(db.Integer, db.ForeignKey('klasse.id'), nullable=False)
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'), nullable=False)
+    lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'), nullable=False)
+    wochentag = db.Column(db.Integer, nullable=False)  # 0=Montag, 6=Sonntag
+    stunde = db.Column(db.Integer, nullable=False)  # 1-10
+    raum = db.Column(db.String(20))
+    gueltig_ab = db.Column(db.Date, nullable=False)
+    gueltig_bis = db.Column(db.Date)
+    
+class Vertretung(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    datum = db.Column(db.Date, nullable=False)
+    stunde = db.Column(db.Integer, nullable=False)
+    klasse_id = db.Column(db.Integer, db.ForeignKey('klasse.id'), nullable=False)
+    original_lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'), nullable=False)
+    vertretung_lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'))
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'), nullable=False)
+    art = db.Column(db.String(20), nullable=False)  # 'vertretung', 'ausfall', 'selbststudium'
+    raum = db.Column(db.String(20))
+    bemerkung = db.Column(db.Text)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Bewertungstyp(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False)  # z.B. 'Klassenarbeit', 'Mündlich', 'Hausaufgabe'
+    gewichtung = db.Column(db.Float, default=1.0)
+    beschreibung = db.Column(db.Text)
+    noten = db.relationship('Note', backref='bewertungstyp', lazy=True)
+
+class Note(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    schueler_id = db.Column(db.Integer, db.ForeignKey('schueler.id'), nullable=False)
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'), nullable=False)
+    bewertungstyp_id = db.Column(db.Integer, db.ForeignKey('bewertungstyp.id'), nullable=False)
+    note = db.Column(db.Float)  # Numerische Note (1.0-6.0)
+    punkte = db.Column(db.Integer)  # Punkte (0-15 für Oberstufe)
+    max_punkte = db.Column(db.Integer)
+    kommentar = db.Column(db.Text)
+    datum = db.Column(db.Date, nullable=False)
+    lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'), nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    
+class Hausaufgabe(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    titel = db.Column(db.String(200), nullable=False)
+    beschreibung = db.Column(db.Text, nullable=False)
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'), nullable=False)
+    klasse_id = db.Column(db.Integer, db.ForeignKey('klasse.id'), nullable=False)
+    lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'), nullable=False)
+    aufgegeben_am = db.Column(db.Date, nullable=False)
+    faellig_am = db.Column(db.Date, nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    abgaben = db.relationship('HausaufgabenAbgabe', backref='hausaufgabe', lazy=True)
+
+class HausaufgabenAbgabe(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    hausaufgabe_id = db.Column(db.Integer, db.ForeignKey('hausaufgabe.id'), nullable=False)
+    schueler_id = db.Column(db.Integer, db.ForeignKey('schueler.id'), nullable=False)
+    abgegeben_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    status = db.Column(db.String(20), default='abgegeben')  # 'abgegeben', 'verspaetet', 'fehlend'
+    kommentar = db.Column(db.Text)
+    datei_pfad = db.Column(db.String(255))
+    bewertung = db.Column(db.String(50))  # 'sehr gut', 'gut', 'befriedigend', etc.
+
+class Nachricht(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    absender_typ = db.Column(db.String(20), nullable=False)  # 'lehrer', 'eltern', 'schueler'
+    absender_id = db.Column(db.Integer, nullable=False)
+    empfaenger_typ = db.Column(db.String(20), nullable=False)
+    empfaenger_id = db.Column(db.Integer, nullable=False)
+    betreff = db.Column(db.String(200), nullable=False)
+    inhalt = db.Column(db.Text, nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    gelesen_am = db.Column(db.DateTime)
+    ist_gelesen = db.Column(db.Boolean, default=False)
+    antwort_auf_id = db.Column(db.Integer, db.ForeignKey('nachricht.id'))
+    
+class Lernziel(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    titel = db.Column(db.String(200), nullable=False)
+    beschreibung = db.Column(db.Text, nullable=False)
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'), nullable=False)
+    klasse_id = db.Column(db.Integer, db.ForeignKey('klasse.id'), nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    erreicht_bis = db.Column(db.Date)
+    fortschritte = db.relationship('LernzielFortschritt', backref='lernziel', lazy=True)
+
+class LernzielFortschritt(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    lernziel_id = db.Column(db.Integer, db.ForeignKey('lernziel.id'), nullable=False)
+    schueler_id = db.Column(db.Integer, db.ForeignKey('schueler.id'), nullable=False)
+    fortschritt = db.Column(db.Integer, default=0)  # 0-100%
+    kommentar = db.Column(db.Text)
+    aktualisiert_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Portfolio(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    schueler_id = db.Column(db.Integer, db.ForeignKey('schueler.id'), nullable=False)
+    titel = db.Column(db.String(200), nullable=False)
+    beschreibung = db.Column(db.Text)
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'))
+    datei_pfad = db.Column(db.String(255))
+    typ = db.Column(db.String(50))  # 'projekt', 'arbeit', 'referat', etc.
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    oeffentlich = db.Column(db.Boolean, default=False)
+
+class Verhaltensbewertung(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    schueler_id = db.Column(db.Integer, db.ForeignKey('schueler.id'), nullable=False)
+    lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'), nullable=False)
+    datum = db.Column(db.Date, nullable=False)
+    kategorie = db.Column(db.String(50), nullable=False)  # 'positiv', 'neutral', 'negativ'
+    beschreibung = db.Column(db.Text, nullable=False)
+    massnahme = db.Column(db.Text)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Benachrichtigung(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    empfaenger_typ = db.Column(db.String(20), nullable=False)  # 'lehrer', 'eltern', 'schueler'
+    empfaenger_id = db.Column(db.Integer, nullable=False)
+    typ = db.Column(db.String(50), nullable=False)  # 'note_neu', 'fehlzeit', 'hausaufgabe', etc.
+    titel = db.Column(db.String(200), nullable=False)
+    inhalt = db.Column(db.Text, nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    gelesen_am = db.Column(db.DateTime)
+    ist_gelesen = db.Column(db.Boolean, default=False)
+    
+class Eltern(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    vorname = db.Column(db.String(50), nullable=False)
+    nachname = db.Column(db.String(50), nullable=False)
+    email = db.Column(db.String(120), nullable=False)
+    telefon = db.Column(db.String(20))
+    adresse = db.Column(db.Text)
+    kinder = db.relationship('Schueler', backref='eltern', lazy=True)
+
+class Pruefung(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    titel = db.Column(db.String(200), nullable=False)
+    fach_id = db.Column(db.Integer, db.ForeignKey('fach.id'), nullable=False)
+    klasse_id = db.Column(db.Integer, db.ForeignKey('klasse.id'), nullable=False)
+    lehrer_id = db.Column(db.Integer, db.ForeignKey('lehrer.id'), nullable=False)
+    datum = db.Column(db.Date, nullable=False)
+    dauer_minuten = db.Column(db.Integer, default=45)
+    max_punkte = db.Column(db.Integer)
+    themen = db.Column(db.Text)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    ergebnisse = db.relationship('PruefungsErgebnis', backref='pruefung', lazy=True)
+
+class PruefungsErgebnis(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    pruefung_id = db.Column(db.Integer, db.ForeignKey('pruefung.id'), nullable=False)
+    schueler_id = db.Column(db.Integer, db.ForeignKey('schueler.id'), nullable=False)
+    punkte = db.Column(db.Integer)
+    note = db.Column(db.Float)
+    kommentar = db.Column(db.Text)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 # Admin Dashboard
 # Daten-Updates verwalten
@@ -2233,6 +2462,740 @@ def statistik2(klasse_id):
         chart_image=chart_image,
     )
 
+# ===== ERWEITERTE KLASSENBUCH-FUNKTIONEN =====
+
+# === Fächer- und Lehrerverwaltung ===
+
+@app.route('/admin/faecher')
+def faecher_verwalten():
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    faecher = Fach.query.all()
+    return render_template('admin/faecher.html', faecher=faecher)
+
+@app.route('/admin/fach/neu', methods=['GET', 'POST'])
+def fach_neu():
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    if request.method == 'POST':
+        name = request.form['name']
+        kuerzel = request.form['kuerzel']
+        farbe = request.form.get('farbe', '#007bff')
+        beschreibung = request.form.get('beschreibung', '')
+        
+        fach = Fach(name=name, kuerzel=kuerzel, farbe=farbe, beschreibung=beschreibung)
+        db.session.add(fach)
+        db.session.commit()
+        flash('Fach erfolgreich erstellt!', 'success')
+        return redirect(url_for('faecher_verwalten'))
+    return render_template('admin/fach_form.html')
+
+@app.route('/admin/fach/<int:fach_id>/bearbeiten', methods=['GET', 'POST'])
+def fach_bearbeiten(fach_id):
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    fach = Fach.query.get_or_404(fach_id)
+    if request.method == 'POST':
+        fach.name = request.form['name']
+        fach.kuerzel = request.form['kuerzel']
+        fach.farbe = request.form.get('farbe', fach.farbe)
+        fach.beschreibung = request.form.get('beschreibung', '')
+        db.session.commit()
+        flash('Fach erfolgreich aktualisiert!', 'success')
+        return redirect(url_for('faecher_verwalten'))
+    return render_template('admin/fach_form.html', fach=fach)
+
+@app.route('/admin/lehrer')
+def lehrer_verwalten():
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    lehrer = Lehrer.query.all()
+    return render_template('admin/lehrer.html', lehrer=lehrer)
+
+@app.route('/admin/lehrer/neu', methods=['GET', 'POST'])
+def lehrer_neu():
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    faecher = Fach.query.all()
+    klassen = Klasse.query.all()
+    
+    if request.method == 'POST':
+        kuerzel = request.form['kuerzel']
+        vorname = request.form['vorname']
+        nachname = request.form['nachname']
+        email = request.form['email']
+        telefon = request.form.get('telefon', '')
+        
+        lehrer = Lehrer(kuerzel=kuerzel, vorname=vorname, nachname=nachname, 
+                       email=email, telefon=telefon)
+        
+        # Fächer zuordnen
+        fach_ids = request.form.getlist('faecher')
+        for fach_id in fach_ids:
+            fach = Fach.query.get(fach_id)
+            if fach:
+                lehrer.faecher.append(fach)
+        
+        # Klassen zuordnen
+        klasse_ids = request.form.getlist('klassen')
+        for klasse_id in klasse_ids:
+            klasse = Klasse.query.get(klasse_id)
+            if klasse:
+                lehrer.klassen.append(klasse)
+        
+        db.session.add(lehrer)
+        db.session.commit()
+        flash('Lehrer erfolgreich erstellt!', 'success')
+        return redirect(url_for('lehrer_verwalten'))
+    
+    return render_template('admin/lehrer_form.html', faecher=faecher, klassen=klassen)
+
+# === Notenverwaltung ===
+
+@app.route('/noten/<int:klasse_id>')
+def noten_uebersicht(klasse_id):
+    klasse = Klasse.query.get_or_404(klasse_id)
+    schueler = Schueler.query.filter_by(klasse_id=klasse_id).order_by(Schueler.nachname).all()
+    faecher = Fach.query.all()
+    bewertungstypen = Bewertungstyp.query.all()
+    
+    # Noten laden - gruppiert nach Schüler und Fach
+    noten_data = defaultdict(lambda: defaultdict(list))
+    for note in Note.query.join(Schueler).filter(Schueler.klasse_id == klasse_id).all():
+        noten_data[note.schueler_id][note.fach_id].append(note)
+    
+    return render_template('noten/uebersicht.html', 
+                         klasse=klasse, 
+                         schueler=schueler, 
+                         faecher=faecher,
+                         bewertungstypen=bewertungstypen,
+                         noten_data=noten_data)
+
+@app.route('/note/neu', methods=['GET', 'POST'])
+def note_neu():
+    if request.method == 'POST':
+        schueler_id = request.form['schueler_id']
+        fach_id = request.form['fach_id']
+        bewertungstyp_id = request.form['bewertungstyp_id']
+        note_wert = request.form.get('note')
+        punkte = request.form.get('punkte')
+        max_punkte = request.form.get('max_punkte')
+        kommentar = request.form.get('kommentar', '')
+        datum = datetime.datetime.strptime(request.form['datum'], '%Y-%m-%d').date()
+        lehrer_id = 1  # TODO: Aus Session/Login
+        
+        note = Note(
+            schueler_id=schueler_id,
+            fach_id=fach_id,
+            bewertungstyp_id=bewertungstyp_id,
+            note=float(note_wert) if note_wert else None,
+            punkte=int(punkte) if punkte else None,
+            max_punkte=int(max_punkte) if max_punkte else None,
+            kommentar=kommentar,
+            datum=datum,
+            lehrer_id=lehrer_id
+        )
+        
+        db.session.add(note)
+        db.session.commit()
+        
+        # Benachrichtigung erstellen
+        schueler = Schueler.query.get(schueler_id)
+        fach = Fach.query.get(fach_id)
+        if schueler.eltern_id:
+            benachrichtigung = Benachrichtigung(
+                empfaenger_typ='eltern',
+                empfaenger_id=schueler.eltern_id,
+                typ='note_neu',
+                titel=f'Neue Note in {fach.name}',
+                inhalt=f'{schueler.name} {schueler.nachname} hat eine neue Note in {fach.name}: {note_wert if note_wert else f"{punkte}/{max_punkte} Punkte"}'
+            )
+            db.session.add(benachrichtigung)
+            db.session.commit()
+        
+        flash('Note erfolgreich hinzugefügt!', 'success')
+        return redirect(url_for('noten_uebersicht', klasse_id=schueler.klasse_id))
+    
+    # GET Request - Formular anzeigen
+    klasse_id = request.args.get('klasse_id')
+    klasse = Klasse.query.get_or_404(klasse_id) if klasse_id else None
+    schueler = Schueler.query.filter_by(klasse_id=klasse_id).all() if klasse_id else Schueler.query.all()
+    faecher = Fach.query.all()
+    bewertungstypen = Bewertungstyp.query.all()
+    
+    return render_template('noten/note_form.html', 
+                         klasse=klasse,
+                         schueler=schueler, 
+                         faecher=faecher, 
+                         bewertungstypen=bewertungstypen)
+
+# === Stundenplan ===
+
+@app.route('/stundenplan/<int:klasse_id>')
+def stundenplan_anzeigen(klasse_id):
+    klasse = Klasse.query.get_or_404(klasse_id)
+    stundenplan = Stundenplan.query.filter_by(klasse_id=klasse_id).all()
+    
+    # Stundenplan in Matrix organisieren (Wochentag x Stunde)
+    stundenplan_matrix = {}
+    for sp in stundenplan:
+        if sp.wochentag not in stundenplan_matrix:
+            stundenplan_matrix[sp.wochentag] = {}
+        stundenplan_matrix[sp.wochentag][sp.stunde] = sp
+    
+    wochentage = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag']
+    stunden = list(range(1, 11))  # 1-10 Stunden
+    
+    return render_template('stundenplan/anzeigen.html', 
+                         klasse=klasse,
+                         stundenplan_matrix=stundenplan_matrix,
+                         wochentage=wochentage,
+                         stunden=stunden)
+
+@app.route('/admin/stundenplan/<int:klasse_id>/bearbeiten', methods=['GET', 'POST'])
+def stundenplan_bearbeiten(klasse_id):
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    
+    klasse = Klasse.query.get_or_404(klasse_id)
+    faecher = Fach.query.all()
+    lehrer = Lehrer.query.all()
+    
+    if request.method == 'POST':
+        # Alten Stundenplan löschen
+        Stundenplan.query.filter_by(klasse_id=klasse_id).delete()
+        
+        # Neuen Stundenplan erstellen
+        for wochentag in range(5):  # Mo-Fr
+            for stunde in range(1, 11):  # 1-10
+                fach_id = request.form.get(f'fach_{wochentag}_{stunde}')
+                lehrer_id = request.form.get(f'lehrer_{wochentag}_{stunde}')
+                raum = request.form.get(f'raum_{wochentag}_{stunde}')
+                
+                if fach_id and lehrer_id:
+                    stundenplan_eintrag = Stundenplan(
+                        klasse_id=klasse_id,
+                        fach_id=fach_id,
+                        lehrer_id=lehrer_id,
+                        wochentag=wochentag,
+                        stunde=stunde,
+                        raum=raum,
+                        gueltig_ab=datetime.date.today()
+                    )
+                    db.session.add(stundenplan_eintrag)
+        
+        db.session.commit()
+        flash('Stundenplan erfolgreich aktualisiert!', 'success')
+        return redirect(url_for('stundenplan_anzeigen', klasse_id=klasse_id))
+    
+    # Aktuellen Stundenplan laden
+    stundenplan = Stundenplan.query.filter_by(klasse_id=klasse_id).all()
+    stundenplan_matrix = {}
+    for sp in stundenplan:
+        if sp.wochentag not in stundenplan_matrix:
+            stundenplan_matrix[sp.wochentag] = {}
+        stundenplan_matrix[sp.wochentag][sp.stunde] = sp
+    
+    return render_template('stundenplan/bearbeiten.html',
+                         klasse=klasse,
+                         faecher=faecher,
+                         lehrer=lehrer,
+                         stundenplan_matrix=stundenplan_matrix)
+
+# === Hausaufgabenverwaltung ===
+
+@app.route('/hausaufgaben/<int:klasse_id>')
+def hausaufgaben_uebersicht(klasse_id):
+    klasse = Klasse.query.get_or_404(klasse_id)
+    heute = datetime.date.today()
+    
+    # Aktuelle Hausaufgaben (noch nicht fällig)
+    aktuelle_hausaufgaben = Hausaufgabe.query.filter(
+        Hausaufgabe.klasse_id == klasse_id,
+        Hausaufgabe.faellig_am >= heute
+    ).order_by(Hausaufgabe.faellig_am).all()
+    
+    # Vergangene Hausaufgaben (letzte 30 Tage)
+    vor_30_tagen = heute - datetime.timedelta(days=30)
+    vergangene_hausaufgaben = Hausaufgabe.query.filter(
+        Hausaufgabe.klasse_id == klasse_id,
+        Hausaufgabe.faellig_am < heute,
+        Hausaufgabe.faellig_am >= vor_30_tagen
+    ).order_by(Hausaufgabe.faellig_am.desc()).all()
+    
+    return render_template('hausaufgaben/uebersicht.html',
+                         klasse=klasse,
+                         aktuelle_hausaufgaben=aktuelle_hausaufgaben,
+                         vergangene_hausaufgaben=vergangene_hausaufgaben)
+
+@app.route('/hausaufgabe/neu', methods=['GET', 'POST'])
+def hausaufgabe_neu():
+    if request.method == 'POST':
+        titel = request.form['titel']
+        beschreibung = request.form['beschreibung']
+        fach_id = request.form['fach_id']
+        klasse_id = request.form['klasse_id']
+        aufgegeben_am = datetime.datetime.strptime(request.form['aufgegeben_am'], '%Y-%m-%d').date()
+        faellig_am = datetime.datetime.strptime(request.form['faellig_am'], '%Y-%m-%d').date()
+        lehrer_id = 1  # TODO: Aus Session
+        
+        hausaufgabe = Hausaufgabe(
+            titel=titel,
+            beschreibung=beschreibung,
+            fach_id=fach_id,
+            klasse_id=klasse_id,
+            lehrer_id=lehrer_id,
+            aufgegeben_am=aufgegeben_am,
+            faellig_am=faellig_am
+        )
+        
+        db.session.add(hausaufgabe)
+        db.session.commit()
+        
+        # Benachrichtigungen an Schüler/Eltern
+        klasse = Klasse.query.get(klasse_id)
+        fach = Fach.query.get(fach_id)
+        for schueler in klasse.schueler:
+            if schueler.eltern_id:
+                benachrichtigung = Benachrichtigung(
+                    empfaenger_typ='eltern',
+                    empfaenger_id=schueler.eltern_id,
+                    typ='hausaufgabe',
+                    titel=f'Neue Hausaufgabe in {fach.name}',
+                    inhalt=f'Neue Hausaufgabe für {schueler.name}: {titel}. Fällig am: {faellig_am.strftime("%d.%m.%Y")}'
+                )
+                db.session.add(benachrichtigung)
+        
+        db.session.commit()
+        flash('Hausaufgabe erfolgreich erstellt!', 'success')
+        return redirect(url_for('hausaufgaben_uebersicht', klasse_id=klasse_id))
+    
+    klasse_id = request.args.get('klasse_id')
+    klasse = Klasse.query.get_or_404(klasse_id) if klasse_id else None
+    faecher = Fach.query.all()
+    klassen = Klasse.query.all()
+    
+    return render_template('hausaufgaben/hausaufgabe_form.html',
+                         klasse=klasse,
+                         faecher=faecher,
+                         klassen=klassen)
+
+# === Kommunikationssystem ===
+
+@app.route('/nachrichten')
+def nachrichten_uebersicht():
+    # TODO: Benutzerauthentifizierung implementieren
+    empfaenger_typ = 'lehrer'  # Placeholder
+    empfaenger_id = 1  # Placeholder
+    
+    nachrichten = Nachricht.query.filter_by(
+        empfaenger_typ=empfaenger_typ,
+        empfaenger_id=empfaenger_id
+    ).order_by(Nachricht.erstellt_am.desc()).all()
+    
+    return render_template('kommunikation/nachrichten.html', nachrichten=nachrichten)
+
+@app.route('/nachricht/neu', methods=['GET', 'POST'])
+def nachricht_neu():
+    if request.method == 'POST':
+        empfaenger_typ = request.form['empfaenger_typ']
+        empfaenger_id = request.form['empfaenger_id']
+        betreff = request.form['betreff']
+        inhalt = request.form['inhalt']
+        
+        # TODO: Absender aus Session
+        absender_typ = 'lehrer'
+        absender_id = 1
+        
+        nachricht = Nachricht(
+            absender_typ=absender_typ,
+            absender_id=absender_id,
+            empfaenger_typ=empfaenger_typ,
+            empfaenger_id=empfaenger_id,
+            betreff=betreff,
+            inhalt=inhalt
+        )
+        
+        db.session.add(nachricht)
+        db.session.commit()
+        flash('Nachricht erfolgreich gesendet!', 'success')
+        return redirect(url_for('nachrichten_uebersicht'))
+    
+    # Listen für Empfängerauswahl
+    lehrer = Lehrer.query.all()
+    eltern = Eltern.query.all()
+    schueler = Schueler.query.all()
+    
+    return render_template('kommunikation/nachricht_form.html',
+                         lehrer=lehrer,
+                         eltern=eltern,
+                         schueler=schueler)
+
+# === Berichte und Auswertungen ===
+
+@app.route('/berichte/<int:schueler_id>')
+def schueler_bericht(schueler_id):
+    schueler = Schueler.query.get_or_404(schueler_id)
+    
+    # Noten des Schülers
+    noten = Note.query.filter_by(schueler_id=schueler_id).order_by(Note.datum.desc()).all()
+    
+    # Notendurchschnitt pro Fach
+    fach_durchschnitte = {}
+    for fach in Fach.query.all():
+        fach_noten = [n.note for n in noten if n.fach_id == fach.id and n.note]
+        if fach_noten:
+            fach_durchschnitte[fach.name] = sum(fach_noten) / len(fach_noten)
+    
+    # Anwesenheitsstatistik
+    anwesenheiten = Anwesenheit.query.filter_by(schueler_id=schueler_id).all()
+    anwesenheits_stats = {
+        'anwesend': len([a for a in anwesenheiten if a.anwesend]),
+        'entschuldigt': len([a for a in anwesenheiten if a.entschuldigt and not a.anwesend]),
+        'unentschuldigt': len([a for a in anwesenheiten if not a.anwesend and not a.entschuldigt])
+    }
+    
+    # Verhaltensbewertungen
+    verhalten = Verhaltensbewertung.query.filter_by(schueler_id=schueler_id).order_by(Verhaltensbewertung.datum.desc()).limit(10).all()
+    
+    return render_template('berichte/schueler_bericht.html',
+                         schueler=schueler,
+                         noten=noten,
+                         fach_durchschnitte=fach_durchschnitte,
+                         anwesenheits_stats=anwesenheits_stats,
+                         verhalten=verhalten)
+
+# Hilfsfunktionen
+
+def benachrichtigung_senden(empfaenger_typ, empfaenger_id, typ, titel, inhalt):
+    """Hilfsfunktion zum Senden von Benachrichtigungen"""
+    benachrichtigung = Benachrichtigung(
+        empfaenger_typ=empfaenger_typ,
+        empfaenger_id=empfaenger_id,
+        typ=typ,
+        titel=titel,
+        inhalt=inhalt
+    )
+    db.session.add(benachrichtigung)
+    db.session.commit()
+
+def notendurchschnitt_berechnen(schueler_id, fach_id=None):
+    """Berechnet den Notendurchschnitt eines Schülers (optional für ein Fach)"""
+    query = Note.query.filter_by(schueler_id=schueler_id)
+    if fach_id:
+        query = query.filter_by(fach_id=fach_id)
+    
+    noten = [n.note for n in query.all() if n.note]
+    return sum(noten) / len(noten) if noten else None
+
+# === Vertretungsplan ===
+
+@app.route('/vertretung/<int:klasse_id>')
+def vertretungsplan(klasse_id):
+    klasse = Klasse.query.get_or_404(klasse_id)
+    heute = datetime.date.today()
+    
+    # Vertretungen für die nächsten 7 Tage
+    naechste_woche = heute + datetime.timedelta(days=7)
+    vertretungen = Vertretung.query.filter(
+        Vertretung.klasse_id == klasse_id,
+        Vertretung.datum >= heute,
+        Vertretung.datum <= naechste_woche
+    ).order_by(Vertretung.datum, Vertretung.stunde).all()
+    
+    return render_template('vertretung/plan.html', klasse=klasse, vertretungen=vertretungen)
+
+@app.route('/admin/vertretung/neu', methods=['GET', 'POST'])
+def vertretung_neu():
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+        
+    if request.method == 'POST':
+        datum = datetime.datetime.strptime(request.form['datum'], '%Y-%m-%d').date()
+        stunde = int(request.form['stunde'])
+        klasse_id = request.form['klasse_id']
+        original_lehrer_id = request.form['original_lehrer_id']
+        vertretung_lehrer_id = request.form.get('vertretung_lehrer_id')
+        fach_id = request.form['fach_id']
+        art = request.form['art']
+        raum = request.form.get('raum', '')
+        bemerkung = request.form.get('bemerkung', '')
+        
+        vertretung = Vertretung(
+            datum=datum,
+            stunde=stunde,
+            klasse_id=klasse_id,
+            original_lehrer_id=original_lehrer_id,
+            vertretung_lehrer_id=vertretung_lehrer_id if vertretung_lehrer_id else None,
+            fach_id=fach_id,
+            art=art,
+            raum=raum,
+            bemerkung=bemerkung
+        )
+        
+        db.session.add(vertretung)
+        db.session.commit()
+        
+        # Benachrichtigungen senden
+        klasse = Klasse.query.get(klasse_id)
+        for schueler in klasse.schueler:
+            if schueler.eltern_id:
+                benachrichtigung_senden(
+                    'eltern', schueler.eltern_id, 'vertretung',
+                    f'Vertretung in Klasse {klasse.name}',
+                    f'Am {datum.strftime("%d.%m.%Y")} in der {stunde}. Stunde: {art}'
+                )
+        
+        flash('Vertretung erfolgreich erstellt!', 'success')
+        return redirect(url_for('vertretungsplan', klasse_id=klasse_id))
+    
+    klassen = Klasse.query.all()
+    lehrer = Lehrer.query.all()
+    faecher = Fach.query.all()
+    
+    return render_template('vertretung/form.html', 
+                         klassen=klassen, 
+                         lehrer=lehrer, 
+                         faecher=faecher)
+
+# === Bewertungstypen-Verwaltung ===
+
+@app.route('/admin/bewertungstypen')
+def bewertungstypen_verwalten():
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    bewertungstypen = Bewertungstyp.query.all()
+    return render_template('admin/bewertungstypen.html', bewertungstypen=bewertungstypen)
+
+@app.route('/admin/bewertungstyp/neu', methods=['GET', 'POST'])
+def bewertungstyp_neu():
+    if not session.get('admin'):
+        return redirect(url_for('blog_admin_login'))
+    if request.method == 'POST':
+        name = request.form['name']
+        gewichtung = float(request.form.get('gewichtung', 1.0))
+        beschreibung = request.form.get('beschreibung', '')
+        
+        bewertungstyp = Bewertungstyp(name=name, gewichtung=gewichtung, beschreibung=beschreibung)
+        db.session.add(bewertungstyp)
+        db.session.commit()
+        flash('Bewertungstyp erfolgreich erstellt!', 'success')
+        return redirect(url_for('bewertungstypen_verwalten'))
+    
+    return render_template('admin/bewertungstyp_form.html')
+
+# === Portfolio und Lernziele ===
+
+@app.route('/portfolio/<int:schueler_id>')
+def portfolio_anzeigen(schueler_id):
+    schueler = Schueler.query.get_or_404(schueler_id)
+    portfolios = Portfolio.query.filter_by(schueler_id=schueler_id).order_by(Portfolio.erstellt_am.desc()).all()
+    return render_template('portfolio/anzeigen.html', schueler=schueler, portfolios=portfolios)
+
+@app.route('/portfolio/neu', methods=['GET', 'POST'])
+def portfolio_neu():
+    if request.method == 'POST':
+        schueler_id = request.form['schueler_id']
+        titel = request.form['titel']
+        beschreibung = request.form.get('beschreibung', '')
+        fach_id = request.form.get('fach_id')
+        typ = request.form.get('typ', 'projekt')
+        oeffentlich = 'oeffentlich' in request.form
+        
+        # Datei-Upload verarbeiten
+        datei_pfad = None
+        if 'datei' in request.files:
+            datei = request.files['datei']
+            if datei.filename:
+                filename = secure_filename(datei.filename)
+                upload_path = os.path.join(app.config['UPLOAD_FOLDER'], 'portfolio')
+                os.makedirs(upload_path, exist_ok=True)
+                datei_pfad = os.path.join(upload_path, filename)
+                datei.save(datei_pfad)
+        
+        portfolio = Portfolio(
+            schueler_id=schueler_id,
+            titel=titel,
+            beschreibung=beschreibung,
+            fach_id=fach_id if fach_id else None,
+            datei_pfad=datei_pfad,
+            typ=typ,
+            oeffentlich=oeffentlich
+        )
+        
+        db.session.add(portfolio)
+        db.session.commit()
+        flash('Portfolio-Eintrag erfolgreich erstellt!', 'success')
+        return redirect(url_for('portfolio_anzeigen', schueler_id=schueler_id))
+    
+    schueler_id = request.args.get('schueler_id')
+    schueler = Schueler.query.get_or_404(schueler_id) if schueler_id else None
+    alle_schueler = Schueler.query.all()
+    faecher = Fach.query.all()
+    
+    return render_template('portfolio/form.html', 
+                         schueler=schueler, 
+                         alle_schueler=alle_schueler,
+                         faecher=faecher)
+
+@app.route('/lernziele/<int:klasse_id>')
+def lernziele_uebersicht(klasse_id):
+    klasse = Klasse.query.get_or_404(klasse_id)
+    lernziele = Lernziel.query.filter_by(klasse_id=klasse_id).order_by(Lernziel.erstellt_am.desc()).all()
+    
+    # Fortschritte für jeden Schüler laden
+    fortschritte = {}
+    for lernziel in lernziele:
+        fortschritte[lernziel.id] = {}
+        for schueler in klasse.schueler:
+            fortschritt = LernzielFortschritt.query.filter_by(
+                lernziel_id=lernziel.id, 
+                schueler_id=schueler.id
+            ).first()
+            fortschritte[lernziel.id][schueler.id] = fortschritt.fortschritt if fortschritt else 0
+    
+    return render_template('lernziele/uebersicht.html', 
+                         klasse=klasse, 
+                         lernziele=lernziele, 
+                         fortschritte=fortschritte)
+
+# === Verhaltensbeobachtungen ===
+
+@app.route('/verhalten/<int:schueler_id>')
+def verhalten_uebersicht(schueler_id):
+    schueler = Schueler.query.get_or_404(schueler_id)
+    bewertungen = Verhaltensbewertung.query.filter_by(schueler_id=schueler_id).order_by(Verhaltensbewertung.datum.desc()).all()
+    return render_template('verhalten/uebersicht.html', schueler=schueler, bewertungen=bewertungen)
+
+@app.route('/verhalten/neu', methods=['GET', 'POST'])
+def verhalten_neu():
+    if request.method == 'POST':
+        schueler_id = request.form['schueler_id']
+        datum = datetime.datetime.strptime(request.form['datum'], '%Y-%m-%d').date()
+        kategorie = request.form['kategorie']
+        beschreibung = request.form['beschreibung']
+        massnahme = request.form.get('massnahme', '')
+        lehrer_id = 1  # TODO: Aus Session
+        
+        bewertung = Verhaltensbewertung(
+            schueler_id=schueler_id,
+            lehrer_id=lehrer_id,
+            datum=datum,
+            kategorie=kategorie,
+            beschreibung=beschreibung,
+            massnahme=massnahme
+        )
+        
+        db.session.add(bewertung)
+        db.session.commit()
+        
+        # Benachrichtigung an Eltern bei negativem Verhalten
+        if kategorie == 'negativ':
+            schueler = Schueler.query.get(schueler_id)
+            if schueler.eltern_id:
+                benachrichtigung_senden(
+                    'eltern', schueler.eltern_id, 'verhalten',
+                    'Verhaltensbeobachtung',
+                    f'Verhaltensbeobachtung für {schueler.name}: {beschreibung}'
+                )
+        
+        flash('Verhaltensbewertung erfolgreich erstellt!', 'success')
+        return redirect(url_for('verhalten_uebersicht', schueler_id=schueler_id))
+    
+    schueler_id = request.args.get('schueler_id')
+    schueler = Schueler.query.get_or_404(schueler_id) if schueler_id else None
+    alle_schueler = Schueler.query.all()
+    
+    return render_template('verhalten/form.html', schueler=schueler, alle_schueler=alle_schueler)
+
+# === Erweiterte Klassenbuch-Übersicht ===
+
+@app.route('/klassenbuch_erweitert/<int:klasse_id>')
+def klassenbuch_erweitert(klasse_id):
+    klasse = Klasse.query.get_or_404(klasse_id)
+    
+    # Dashboard-Daten sammeln
+    schueler_anzahl = len(klasse.schueler)
+    aktuelle_hausaufgaben = Hausaufgabe.query.filter(
+        Hausaufgabe.klasse_id == klasse_id,
+        Hausaufgabe.faellig_am >= datetime.date.today()
+    ).count()
+    
+    # Letzte Unterrichtseinheiten
+    letzte_stunden = Unterrichtseinheit.query.filter_by(klasse_id=klasse_id).order_by(
+        Unterrichtseinheit.datum.desc()
+    ).limit(5).all()
+    
+    # Anwesenheitsstatistik der letzten 30 Tage
+    vor_30_tagen = datetime.date.today() - datetime.timedelta(days=30)
+    anwesenheiten = db.session.query(Anwesenheit).join(Unterrichtseinheit).filter(
+        Unterrichtseinheit.klasse_id == klasse_id,
+        Unterrichtseinheit.datum >= vor_30_tagen
+    ).all()
+    
+    anwesenheits_stats = {
+        'anwesend': len([a for a in anwesenheiten if a.anwesend]),
+        'entschuldigt': len([a for a in anwesenheiten if a.entschuldigt and not a.anwesend]),
+        'unentschuldigt': len([a for a in anwesenheiten if not a.anwesend and not a.entschuldigt])
+    }
+    
+    # Kommende Termine
+    heute = datetime.date.today()
+    naechste_woche = heute + datetime.timedelta(days=7)
+    kommende_termine = []
+    
+    # Hausaufgaben
+    hausaufgaben = Hausaufgabe.query.filter(
+        Hausaufgabe.klasse_id == klasse_id,
+        Hausaufgabe.faellig_am >= heute,
+        Hausaufgabe.faellig_am <= naechste_woche
+    ).all()
+    for ha in hausaufgaben:
+        kommende_termine.append({
+            'typ': 'Hausaufgabe',
+            'titel': ha.titel,
+            'datum': ha.faellig_am,
+            'fach': ha.fach.name if ha.fach else ''
+        })
+    
+    # Prüfungen
+    pruefungen = Pruefung.query.filter(
+        Pruefung.klasse_id == klasse_id,
+        Pruefung.datum >= heute,
+        Pruefung.datum <= naechste_woche
+    ).all()
+    for p in pruefungen:
+        kommende_termine.append({
+            'typ': 'Prüfung',
+            'titel': p.titel,
+            'datum': p.datum,
+            'fach': p.fach.name if p.fach else ''
+        })
+    
+    # Vertretungen
+    vertretungen = Vertretung.query.filter(
+        Vertretung.klasse_id == klasse_id,
+        Vertretung.datum >= heute,
+        Vertretung.datum <= naechste_woche
+    ).all()
+    for v in vertretungen:
+        kommende_termine.append({
+            'typ': 'Vertretung',
+            'titel': f'{v.stunde}. Stunde - {v.art}',
+            'datum': v.datum,
+            'fach': v.fach.name if v.fach else ''
+        })
+    
+    # Nach Datum sortieren
+    kommende_termine.sort(key=lambda x: x['datum'])
+    
+    return render_template('klassenbuch/erweitert.html',
+                         klasse=klasse,
+                         schueler_anzahl=schueler_anzahl,
+                         aktuelle_hausaufgaben=aktuelle_hausaufgaben,
+                         letzte_stunden=letzte_stunden,
+                         anwesenheits_stats=anwesenheits_stats,
+                         kommende_termine=kommende_termine)
 
 # Datenbank initialisieren
 @app.before_first_request
