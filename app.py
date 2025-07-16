@@ -1,8 +1,9 @@
-from flask import Flask, render_template, request, redirect, url_for, jsonify, abort, send_file, session, flash
+from flask import Flask, render_template, request, redirect, url_for, jsonify, abort, send_file, session, flash, make_response
 import datetime
 import json
 import os
 import base64
+from decimal import Decimal
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.utils import secure_filename
 import matplotlib.pyplot as plt
@@ -13,7 +14,13 @@ from collections import defaultdict
 from flask_moment import Moment
 from matplotlib.backends.backend_pdf import PdfPages
 from flask_migrate import Migrate
-from sqlalchemy import func, and_, or_
+from sqlalchemy import func, and_, or_, extract
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+from reportlab.lib.units import cm
+import qrcode
 
 #from weasyprint import HTML, CSS
 # App erstellen
@@ -141,21 +148,299 @@ class Process(db.Model):
 
 class Transaction(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    description = db.Column(db.String(255), nullable=False)
-    amount = db.Column(db.Float)
-    type = db.Column(db.String(50), nullable=False) # 'Einnahme', 'Ausgabe', 'note'
-    category = db.Column(db.String(100))
-    date = db.Column(db.Date, nullable=False)
-    cost_center_id = db.Column(db.Integer, db.ForeignKey('cost_center.id'), nullable=True)
-    process_id = db.Column(db.Integer, db.ForeignKey('process.id'), nullable=True)
-    document_filename = db.Column(db.String(255), nullable=True)
-    # Add other fields if you have them, like 'is_approved', 'accounting_circle'
-    is_approved = db.Column(db.Boolean, default=False)
-    accounting_circle = db.Column(db.String(100), default='Hauptbuch')
-
-
+    beschreibung = db.Column(db.String(255), nullable=False)
+    betrag = db.Column(db.Numeric(10, 2), nullable=False)
+    typ = db.Column(db.String(50), nullable=False)  # 'einnahme', 'ausgabe'
+    kategorie = db.Column(db.String(100))
+    buchungsdatum = db.Column(db.Date, nullable=False)
+    zahlungsart = db.Column(db.String(50), nullable=False)  # 'ueberweisung', 'bar', 'paypal', etc.
+    kostenstelle_id = db.Column(db.Integer, db.ForeignKey('abteilung.id'), nullable=False)
+    beleg_pfad = db.Column(db.String(255))
+    
+    # Erweiterte Felder
+    belegnummer = db.Column(db.String(50), unique=True)
+    mwst_satz = db.Column(db.Numeric(5, 2), default=0.00)
+    mwst_betrag = db.Column(db.Numeric(10, 2), default=0.00)
+    netto_betrag = db.Column(db.Numeric(10, 2))
+    projekt_id = db.Column(db.Integer, db.ForeignKey('projekt.id'))
+    verwendungszweck = db.Column(db.Text)
+    
+    # Metadaten
+    erstellt_von = db.Column(db.Integer, db.ForeignKey('benutzer.id'), nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    geaendert_von = db.Column(db.Integer, db.ForeignKey('benutzer.id'))
+    geaendert_am = db.Column(db.DateTime)
+    genehmigt = db.Column(db.Boolean, default=False)
+    genehmigt_von = db.Column(db.Integer, db.ForeignKey('benutzer.id'))
+    genehmigt_am = db.Column(db.DateTime)
+    
+    # Wiederkehrende Buchungen
+    ist_wiederkehrend = db.Column(db.Boolean, default=False)
+    wiederkehr_intervall = db.Column(db.String(20))  # 'monatlich', 'jaehrlich', etc.
+    naechste_buchung = db.Column(db.Date)
+    parent_id = db.Column(db.Integer, db.ForeignKey('transaction.id'))  # Für Splitbuchungen
+    
     def __repr__(self):
-        return f"<Transaction {self.description}>"
+        return f"<Transaction {self.beschreibung}: {self.betrag}€>"
+
+# ===== ERWEITERTE FINANZMODELLE =====
+
+class Abteilung(db.Model):
+    """Abteilungen/Kostenstellen der Gemeinde"""
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    code = db.Column(db.String(20), unique=True, nullable=False)
+    beschreibung = db.Column(db.Text)
+    abteilungsleiter_id = db.Column(db.Integer, db.ForeignKey('benutzer.id'))
+    aktiv = db.Column(db.Boolean, default=True)
+    budget_jaehrlich = db.Column(db.Numeric(12, 2))
+    
+    # Relationships
+    transaktionen = db.relationship('Transaction', backref='abteilung', lazy=True)
+    rechnungen = db.relationship('Rechnung', backref='abteilung', lazy=True)
+    projekte = db.relationship('Projekt', backref='abteilung', lazy=True)
+    
+    def __repr__(self):
+        return f"<Abteilung {self.code} - {self.name}>"
+
+class Projekt(db.Model):
+    """Projekte für Spendenzuordnung"""
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    beschreibung = db.Column(db.Text)
+    abteilung_id = db.Column(db.Integer, db.ForeignKey('abteilung.id'), nullable=False)
+    start_datum = db.Column(db.Date)
+    end_datum = db.Column(db.Date)
+    spendenziel = db.Column(db.Numeric(10, 2))
+    aktiv = db.Column(db.Boolean, default=True)
+    
+    # Relationships
+    spenden = db.relationship('Spende', backref='projekt', lazy=True)
+    transaktionen = db.relationship('Transaction', backref='projekt', lazy=True)
+    
+    def gespendeter_betrag(self):
+        return sum(spende.betrag for spende in self.spenden)
+    
+    def __repr__(self):
+        return f"<Projekt {self.name}>"
+
+class Spender(db.Model):
+    """Spenderverwaltung"""
+    id = db.Column(db.Integer, primary_key=True)
+    anrede = db.Column(db.String(20))
+    vorname = db.Column(db.String(50))
+    nachname = db.Column(db.String(50), nullable=False)
+    organisation = db.Column(db.String(100))
+    strasse = db.Column(db.String(100))
+    plz = db.Column(db.String(10))
+    ort = db.Column(db.String(50))
+    land = db.Column(db.String(50), default='Deutschland')
+    telefon = db.Column(db.String(20))
+    email = db.Column(db.String(120))
+    
+    # Spendenpräferenzen
+    newsletter = db.Column(db.Boolean, default=False)
+    dsgvo_zustimmung = db.Column(db.Boolean, default=False)
+    dsgvo_datum = db.Column(db.DateTime)
+    
+    # Relationships
+    spenden = db.relationship('Spende', backref='spender', lazy=True)
+    
+    @property
+    def vollstaendiger_name(self):
+        if self.organisation:
+            return self.organisation
+        return f"{self.vorname} {self.nachname}".strip()
+    
+    def __repr__(self):
+        return f"<Spender {self.vollstaendiger_name}>"
+
+class Spende(db.Model):
+    """Spendenverwaltung"""
+    id = db.Column(db.Integer, primary_key=True)
+    spender_id = db.Column(db.Integer, db.ForeignKey('spender.id'), nullable=False)
+    projekt_id = db.Column(db.Integer, db.ForeignKey('projekt.id'))
+    betrag = db.Column(db.Numeric(10, 2), nullable=False)
+    spende_datum = db.Column(db.Date, nullable=False)
+    zahlungsart = db.Column(db.String(50), nullable=False)
+    verwendungszweck = db.Column(db.Text)
+    
+    # Spendenbescheinigung
+    quittung_erstellt = db.Column(db.Boolean, default=False)
+    quittungsnummer = db.Column(db.String(50), unique=True)
+    quittung_datum = db.Column(db.Date)
+    quittung_pfad = db.Column(db.String(255))
+    per_email_gesendet = db.Column(db.Boolean, default=False)
+    
+    # Metadaten
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<Spende {self.betrag}€ von {self.spender.vollstaendiger_name}>"
+
+class Rechnung(db.Model):
+    """Rechnungsstellung"""
+    id = db.Column(db.Integer, primary_key=True)
+    rechnungsnummer = db.Column(db.String(50), unique=True, nullable=False)
+    datum = db.Column(db.Date, nullable=False)
+    faelligkeitsdatum = db.Column(db.Date, nullable=False)
+    
+    # Kunde
+    kunde_name = db.Column(db.String(100), nullable=False)
+    kunde_strasse = db.Column(db.String(100))
+    kunde_plz = db.Column(db.String(10))
+    kunde_ort = db.Column(db.String(50))
+    kunde_email = db.Column(db.String(120))
+    
+    # Rechnung
+    abteilung_id = db.Column(db.Integer, db.ForeignKey('abteilung.id'), nullable=False)
+    netto_betrag = db.Column(db.Numeric(10, 2), nullable=False)
+    mwst_betrag = db.Column(db.Numeric(10, 2), default=0.00)
+    brutto_betrag = db.Column(db.Numeric(10, 2), nullable=False)
+    verwendungszweck = db.Column(db.Text)
+    bemerkung = db.Column(db.Text)
+    
+    # Status
+    status = db.Column(db.String(20), default='offen')  # 'offen', 'bezahlt', 'ueberfaellig', 'storniert'
+    bezahlt_am = db.Column(db.Date)
+    pdf_pfad = db.Column(db.String(255))
+    per_email_gesendet = db.Column(db.Boolean, default=False)
+    
+    # Metadaten
+    erstellt_von = db.Column(db.Integer, db.ForeignKey('benutzer.id'), nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    
+    # Relationships
+    positionen = db.relationship('RechnungsPosition', backref='rechnung', lazy=True, cascade='all, delete-orphan')
+    
+    def __repr__(self):
+        return f"<Rechnung {self.rechnungsnummer}: {self.brutto_betrag}€>"
+
+class RechnungsPosition(db.Model):
+    """Rechnungspositionen"""
+    id = db.Column(db.Integer, primary_key=True)
+    rechnung_id = db.Column(db.Integer, db.ForeignKey('rechnung.id'), nullable=False)
+    position = db.Column(db.Integer, nullable=False)
+    beschreibung = db.Column(db.Text, nullable=False)
+    menge = db.Column(db.Numeric(10, 2), default=1.00)
+    einheit = db.Column(db.String(20), default='Stück')
+    einzelpreis = db.Column(db.Numeric(10, 2), nullable=False)
+    mwst_satz = db.Column(db.Numeric(5, 2), default=19.00)
+    
+    @property
+    def netto_betrag(self):
+        return self.menge * self.einzelpreis
+    
+    @property
+    def mwst_betrag(self):
+        return self.netto_betrag * (self.mwst_satz / 100)
+    
+    @property
+    def brutto_betrag(self):
+        return self.netto_betrag + self.mwst_betrag
+
+class Benutzer(db.Model):
+    """Erweiterte Benutzerverwaltung für Finanzsystem"""
+    id = db.Column(db.Integer, primary_key=True)
+    benutzername = db.Column(db.String(64), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    passwort_hash = db.Column(db.String(256), nullable=False)
+    
+    # Persönliche Daten
+    vorname = db.Column(db.String(50))
+    nachname = db.Column(db.String(50))
+    telefon = db.Column(db.String(20))
+    
+    # Berechtigungen
+    rolle = db.Column(db.String(20), nullable=False, default='benutzer')  # 'admin', 'buchhalter', 'abteilungsleiter', 'benutzer'
+    abteilung_id = db.Column(db.Integer, db.ForeignKey('abteilung.id'))
+    aktiv = db.Column(db.Boolean, default=True)
+    
+    # Metadaten
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    letzter_login = db.Column(db.DateTime)
+    
+    def set_passwort(self, passwort):
+        from werkzeug.security import generate_password_hash
+        self.passwort_hash = generate_password_hash(passwort)
+        
+    def check_passwort(self, passwort):
+        from werkzeug.security import check_password_hash
+        return check_password_hash(self.passwort_hash, passwort)
+    
+    def __repr__(self):
+        return f"<Benutzer {self.benutzername}>"
+
+class AuditLog(db.Model):
+    """Revisionssichere Protokollierung aller Änderungen"""
+    id = db.Column(db.Integer, primary_key=True)
+    benutzer_id = db.Column(db.Integer, db.ForeignKey('benutzer.id'), nullable=False)
+    tabelle = db.Column(db.String(50), nullable=False)
+    datensatz_id = db.Column(db.Integer, nullable=False)
+    aktion = db.Column(db.String(20), nullable=False)  # 'create', 'update', 'delete'
+    alte_werte = db.Column(db.Text)  # JSON
+    neue_werte = db.Column(db.Text)  # JSON
+    zeitstempel = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    ip_adresse = db.Column(db.String(45))
+    
+    def __repr__(self):
+        return f"<AuditLog {self.aktion} auf {self.tabelle}>"
+
+class WiederkehrendeBuchung(db.Model):
+    """Template für wiederkehrende Buchungen"""
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    beschreibung = db.Column(db.String(255), nullable=False)
+    betrag = db.Column(db.Numeric(10, 2), nullable=False)
+    typ = db.Column(db.String(50), nullable=False)
+    kategorie = db.Column(db.String(100))
+    zahlungsart = db.Column(db.String(50), nullable=False)
+    abteilung_id = db.Column(db.Integer, db.ForeignKey('abteilung.id'), nullable=False)
+    
+    # Wiederholung
+    intervall = db.Column(db.String(20), nullable=False)  # 'monatlich', 'jaehrlich'
+    naechste_ausfuehrung = db.Column(db.Date, nullable=False)
+    letzte_ausfuehrung = db.Column(db.Date)
+    aktiv = db.Column(db.Boolean, default=True)
+    
+    # Metadaten
+    erstellt_von = db.Column(db.Integer, db.ForeignKey('benutzer.id'), nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Kassenbuch(db.Model):
+    """Kassenmodul für Barzahlungen"""
+    id = db.Column(db.Integer, primary_key=True)
+    datum = db.Column(db.Date, nullable=False)
+    beschreibung = db.Column(db.String(255), nullable=False)
+    einnahme = db.Column(db.Numeric(10, 2), default=0.00)
+    ausgabe = db.Column(db.Numeric(10, 2), default=0.00)
+    kassenstand = db.Column(db.Numeric(10, 2), nullable=False)
+    abteilung_id = db.Column(db.Integer, db.ForeignKey('abteilung.id'), nullable=False)
+    beleg_nr = db.Column(db.String(50))
+    
+    # Metadaten
+    erfasst_von = db.Column(db.Integer, db.ForeignKey('benutzer.id'), nullable=False)
+    erfasst_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+class Budgetplanung(db.Model):
+    """Budgetplanung pro Abteilung"""
+    id = db.Column(db.Integer, primary_key=True)
+    abteilung_id = db.Column(db.Integer, db.ForeignKey('abteilung.id'), nullable=False)
+    jahr = db.Column(db.Integer, nullable=False)
+    monat = db.Column(db.Integer)  # Null für Jahresbudget
+    
+    # Geplante Beträge
+    geplante_einnahmen = db.Column(db.Numeric(12, 2), default=0.00)
+    geplante_ausgaben = db.Column(db.Numeric(12, 2), default=0.00)
+    
+    # Ist-Werte (werden automatisch berechnet)
+    ist_einnahmen = db.Column(db.Numeric(12, 2), default=0.00)
+    ist_ausgaben = db.Column(db.Numeric(12, 2), default=0.00)
+    
+    # Metadaten
+    erstellt_von = db.Column(db.Integer, db.ForeignKey('benutzer.id'), nullable=False)
+    erstellt_am = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    letzte_aktualisierung = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
 # MODELS
 class Klasse(db.Model):
@@ -2887,6 +3172,914 @@ def notendurchschnitt_berechnen(schueler_id, fach_id=None):
     
     noten = [n.note for n in query.all() if n.note]
     return sum(noten) / len(noten) if noten else None
+
+# ===== ERWEITERTE FINANZBUCHHALTUNG =====
+
+# Hilfsfunktionen für Finanzsystem
+
+def log_audit(benutzer_id, tabelle, datensatz_id, aktion, alte_werte=None, neue_werte=None):
+    """Protokolliert alle Änderungen für Revisionssicherheit"""
+    log = AuditLog(
+        benutzer_id=benutzer_id,
+        tabelle=tabelle,
+        datensatz_id=datensatz_id,
+        aktion=aktion,
+        alte_werte=json.dumps(alte_werte) if alte_werte else None,
+        neue_werte=json.dumps(neue_werte) if neue_werte else None,
+        ip_adresse=request.remote_addr
+    )
+    db.session.add(log)
+    db.session.commit()
+
+def generate_belegnummer():
+    """Generiert eine eindeutige Belegnummer"""
+    import uuid
+    heute = datetime.date.today()
+    return f"BEL-{heute.strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
+
+def generate_rechnungsnummer():
+    """Generiert eine eindeutige Rechnungsnummer"""
+    heute = datetime.date.today()
+    jahr = heute.year
+    letzte_rechnung = Rechnung.query.filter(
+        extract('year', Rechnung.datum) == jahr
+    ).order_by(Rechnung.id.desc()).first()
+    
+    if letzte_rechnung:
+        nummer = int(letzte_rechnung.rechnungsnummer.split('-')[-1]) + 1
+    else:
+        nummer = 1
+    
+    return f"RE-{jahr}-{nummer:04d}"
+
+def generate_spenden_quittungsnummer():
+    """Generiert eine eindeutige Spenden-Quittungsnummer"""
+    heute = datetime.date.today()
+    jahr = heute.year
+    letzte_spende = Spende.query.filter(
+        extract('year', Spende.spende_datum) == jahr,
+        Spende.quittungsnummer.isnot(None)
+    ).order_by(Spende.id.desc()).first()
+    
+    if letzte_spende:
+        nummer = int(letzte_spende.quittungsnummer.split('-')[-1]) + 1
+    else:
+        nummer = 1
+    
+    return f"SQ-{jahr}-{nummer:04d}"
+
+def berechne_abteilungs_saldo(abteilung_id, von_datum=None, bis_datum=None):
+    """Berechnet das Saldo einer Abteilung für einen Zeitraum"""
+    query = Transaction.query.filter_by(kostenstelle_id=abteilung_id)
+    
+    if von_datum:
+        query = query.filter(Transaction.buchungsdatum >= von_datum)
+    if bis_datum:
+        query = query.filter(Transaction.buchungsdatum <= bis_datum)
+    
+    transaktionen = query.all()
+    
+    einnahmen = sum(t.betrag for t in transaktionen if t.typ == 'einnahme')
+    ausgaben = sum(t.betrag for t in transaktionen if t.typ == 'ausgabe')
+    
+    return {
+        'einnahmen': einnahmen,
+        'ausgaben': ausgaben,
+        'saldo': einnahmen - ausgaben
+    }
+
+# ===== DASHBOARD UND HAUPTSEITEN =====
+
+@app.route('/finanzen')
+def finanzen_dashboard():
+    """Hauptdashboard für Finanzbuchhaltung"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    if not benutzer or not benutzer.aktiv:
+        return redirect(url_for('finanzen_login'))
+    
+    # Dashboard-Daten sammeln
+    heute = datetime.date.today()
+    monat_start = heute.replace(day=1)
+    jahr_start = heute.replace(month=1, day=1)
+    
+    # Gesamtsaldo aller Abteilungen
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        abteilungen = Abteilung.query.filter_by(aktiv=True).all()
+    else:
+        abteilungen = [benutzer.abteilung] if benutzer.abteilung else []
+    
+    gesamt_saldo = {'einnahmen': 0, 'ausgaben': 0, 'saldo': 0}
+    monats_saldo = {'einnahmen': 0, 'ausgaben': 0, 'saldo': 0}
+    
+    for abteilung in abteilungen:
+        # Gesamtsaldo
+        saldo = berechne_abteilungs_saldo(abteilung.id)
+        gesamt_saldo['einnahmen'] += saldo['einnahmen']
+        gesamt_saldo['ausgaben'] += saldo['ausgaben']
+        gesamt_saldo['saldo'] += saldo['saldo']
+        
+        # Monatssaldo
+        monat_saldo = berechne_abteilungs_saldo(abteilung.id, monat_start, heute)
+        monats_saldo['einnahmen'] += monat_saldo['einnahmen']
+        monats_saldo['ausgaben'] += monat_saldo['ausgaben']
+        monats_saldo['saldo'] += monat_saldo['saldo']
+    
+    # Offene Rechnungen
+    offene_rechnungen = Rechnung.query.filter_by(status='offen').count()
+    ueberfaellige_rechnungen = Rechnung.query.filter(
+        Rechnung.status == 'offen',
+        Rechnung.faelligkeitsdatum < heute
+    ).count()
+    
+    # Letzte Transaktionen
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        letzte_transaktionen = Transaction.query.order_by(Transaction.erstellt_am.desc()).limit(10).all()
+    else:
+        letzte_transaktionen = Transaction.query.filter_by(
+            kostenstelle_id=benutzer.abteilung_id
+        ).order_by(Transaction.erstellt_am.desc()).limit(10).all()
+    
+    # Wiederkehrende Buchungen, die ausgeführt werden müssen
+    faellige_buchungen = WiederkehrendeBuchung.query.filter(
+        WiederkehrendeBuchung.aktiv == True,
+        WiederkehrendeBuchung.naechste_ausfuehrung <= heute
+    ).count()
+    
+    return render_template('finanzen/dashboard.html',
+                         benutzer=benutzer,
+                         abteilungen=abteilungen,
+                         gesamt_saldo=gesamt_saldo,
+                         monats_saldo=monats_saldo,
+                         offene_rechnungen=offene_rechnungen,
+                         ueberfaellige_rechnungen=ueberfaellige_rechnungen,
+                         letzte_transaktionen=letzte_transaktionen,
+                         faellige_buchungen=faellige_buchungen)
+
+@app.route('/finanzen/login', methods=['GET', 'POST'])
+def finanzen_login():
+    """Login für Finanzsystem"""
+    if request.method == 'POST':
+        benutzername = request.form['benutzername']
+        passwort = request.form['passwort']
+        
+        benutzer = Benutzer.query.filter_by(benutzername=benutzername, aktiv=True).first()
+        
+        if benutzer and benutzer.check_passwort(passwort):
+            session['benutzer_id'] = benutzer.id
+            session['benutzer_rolle'] = benutzer.rolle
+            
+            # Letzten Login aktualisieren
+            benutzer.letzter_login = datetime.datetime.utcnow()
+            db.session.commit()
+            
+            flash('Erfolgreich angemeldet!', 'success')
+            return redirect(url_for('finanzen_dashboard'))
+        else:
+            flash('Ungültige Anmeldedaten!', 'danger')
+    
+    return render_template('finanzen/login.html')
+
+@app.route('/finanzen/logout')
+def finanzen_logout():
+    """Logout aus Finanzsystem"""
+    session.pop('benutzer_id', None)
+    session.pop('benutzer_rolle', None)
+    flash('Erfolgreich abgemeldet!', 'info')
+    return redirect(url_for('finanzen_login'))
+
+# ===== BUCHUNGEN UND TRANSAKTIONEN =====
+
+@app.route('/finanzen/buchungen')
+def buchungen_liste():
+    """Liste aller Buchungen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    # Filter
+    seite = request.args.get('seite', 1, type=int)
+    abteilung_id = request.args.get('abteilung_id', type=int)
+    von_datum = request.args.get('von_datum')
+    bis_datum = request.args.get('bis_datum')
+    typ = request.args.get('typ')
+    
+    # Query aufbauen
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        query = Transaction.query
+    else:
+        query = Transaction.query.filter_by(kostenstelle_id=benutzer.abteilung_id)
+    
+    if abteilung_id:
+        query = query.filter_by(kostenstelle_id=abteilung_id)
+    
+    if von_datum:
+        query = query.filter(Transaction.buchungsdatum >= datetime.datetime.strptime(von_datum, '%Y-%m-%d').date())
+    
+    if bis_datum:
+        query = query.filter(Transaction.buchungsdatum <= datetime.datetime.strptime(bis_datum, '%Y-%m-%d').date())
+    
+    if typ:
+        query = query.filter_by(typ=typ)
+    
+    # Paginierung
+    buchungen = query.order_by(Transaction.buchungsdatum.desc()).paginate(
+        page=seite, per_page=50, error_out=False
+    )
+    
+    # Abteilungen für Filter
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        abteilungen = Abteilung.query.filter_by(aktiv=True).all()
+    else:
+        abteilungen = [benutzer.abteilung] if benutzer.abteilung else []
+    
+    return render_template('finanzen/buchungen.html',
+                         buchungen=buchungen,
+                         abteilungen=abteilungen,
+                         benutzer=benutzer)
+
+@app.route('/finanzen/buchung/neu', methods=['GET', 'POST'])
+def buchung_neu():
+    """Neue Buchung erstellen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    if request.method == 'POST':
+        # Formular verarbeiten
+        beschreibung = request.form['beschreibung']
+        betrag = Decimal(request.form['betrag'])
+        typ = request.form['typ']
+        kategorie = request.form.get('kategorie', '')
+        buchungsdatum = datetime.datetime.strptime(request.form['buchungsdatum'], '%Y-%m-%d').date()
+        zahlungsart = request.form['zahlungsart']
+        kostenstelle_id = request.form['kostenstelle_id']
+        verwendungszweck = request.form.get('verwendungszweck', '')
+        projekt_id = request.form.get('projekt_id') or None
+        
+        # MwSt berechnen
+        mwst_satz = Decimal(request.form.get('mwst_satz', '0'))
+        if mwst_satz > 0:
+            netto_betrag = betrag / (1 + mwst_satz / 100)
+            mwst_betrag = betrag - netto_betrag
+        else:
+            netto_betrag = betrag
+            mwst_betrag = Decimal('0')
+        
+        # Berechtigung prüfen
+        if benutzer.rolle not in ['admin', 'buchhalter']:
+            if int(kostenstelle_id) != benutzer.abteilung_id:
+                flash('Keine Berechtigung für diese Abteilung!', 'danger')
+                return redirect(url_for('buchung_neu'))
+        
+        # Buchung erstellen
+        buchung = Transaction(
+            beschreibung=beschreibung,
+            betrag=betrag,
+            typ=typ,
+            kategorie=kategorie,
+            buchungsdatum=buchungsdatum,
+            zahlungsart=zahlungsart,
+            kostenstelle_id=kostenstelle_id,
+            verwendungszweck=verwendungszweck,
+            projekt_id=projekt_id,
+            belegnummer=generate_belegnummer(),
+            mwst_satz=mwst_satz,
+            mwst_betrag=mwst_betrag,
+            netto_betrag=netto_betrag,
+            erstellt_von=benutzer.id
+        )
+        
+        # Beleg hochladen
+        if 'beleg' in request.files:
+            beleg = request.files['beleg']
+            if beleg.filename:
+                filename = secure_filename(beleg.filename)
+                upload_path = os.path.join(app.config['UPLOAD_FOLDER'], 'belege')
+                os.makedirs(upload_path, exist_ok=True)
+                beleg_pfad = os.path.join(upload_path, f"{buchung.belegnummer}_{filename}")
+                beleg.save(beleg_pfad)
+                buchung.beleg_pfad = beleg_pfad
+        
+        db.session.add(buchung)
+        db.session.commit()
+        
+        # Audit Log
+        log_audit(benutzer.id, 'transaction', buchung.id, 'create', 
+                 neue_werte={'beschreibung': beschreibung, 'betrag': str(betrag)})
+        
+        flash('Buchung erfolgreich erstellt!', 'success')
+        return redirect(url_for('buchungen_liste'))
+    
+    # Abteilungen laden
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        abteilungen = Abteilung.query.filter_by(aktiv=True).all()
+    else:
+        abteilungen = [benutzer.abteilung] if benutzer.abteilung else []
+    
+    # Projekte laden
+    projekte = Projekt.query.filter_by(aktiv=True).all()
+    
+    return render_template('finanzen/buchung_form.html',
+                         abteilungen=abteilungen,
+                         projekte=projekte,
+                         benutzer=benutzer)
+
+# ===== ABTEILUNGSVERWALTUNG =====
+
+@app.route('/finanzen/admin/abteilungen')
+def abteilungen_verwalten():
+    """Abteilungsverwaltung"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    if benutzer.rolle != 'admin':
+        abort(403)
+    
+    abteilungen = Abteilung.query.all()
+    return render_template('finanzen/admin/abteilungen.html', abteilungen=abteilungen)
+
+@app.route('/finanzen/admin/abteilung/neu', methods=['GET', 'POST'])
+def abteilung_neu():
+    """Neue Abteilung erstellen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    if benutzer.rolle != 'admin':
+        abort(403)
+    
+    if request.method == 'POST':
+        name = request.form['name']
+        code = request.form['code']
+        beschreibung = request.form.get('beschreibung', '')
+        abteilungsleiter_id = request.form.get('abteilungsleiter_id') or None
+        budget_jaehrlich = Decimal(request.form.get('budget_jaehrlich', '0'))
+        
+        abteilung = Abteilung(
+            name=name,
+            code=code,
+            beschreibung=beschreibung,
+            abteilungsleiter_id=abteilungsleiter_id,
+            budget_jaehrlich=budget_jaehrlich
+        )
+        
+        db.session.add(abteilung)
+        db.session.commit()
+        
+        flash('Abteilung erfolgreich erstellt!', 'success')
+        return redirect(url_for('abteilungen_verwalten'))
+    
+    # Verfügbare Abteilungsleiter
+    leiter = Benutzer.query.filter(Benutzer.rolle.in_(['admin', 'abteilungsleiter']), Benutzer.aktiv == True).all()
+    
+    return render_template('finanzen/admin/abteilung_form.html', leiter=leiter)
+
+# ===== SPENDENVERWALTUNG =====
+
+@app.route('/finanzen/spenden')
+def spenden_liste():
+    """Liste aller Spenden"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    # Filter
+    seite = request.args.get('seite', 1, type=int)
+    projekt_id = request.args.get('projekt_id', type=int)
+    von_datum = request.args.get('von_datum')
+    bis_datum = request.args.get('bis_datum')
+    
+    query = Spende.query
+    
+    if projekt_id:
+        query = query.filter_by(projekt_id=projekt_id)
+    
+    if von_datum:
+        query = query.filter(Spende.spende_datum >= datetime.datetime.strptime(von_datum, '%Y-%m-%d').date())
+    
+    if bis_datum:
+        query = query.filter(Spende.spende_datum <= datetime.datetime.strptime(bis_datum, '%Y-%m-%d').date())
+    
+    spenden = query.order_by(Spende.spende_datum.desc()).paginate(
+        page=seite, per_page=50, error_out=False
+    )
+    
+    projekte = Projekt.query.filter_by(aktiv=True).all()
+    
+    return render_template('finanzen/spenden.html',
+                         spenden=spenden,
+                         projekte=projekte,
+                         benutzer=benutzer)
+
+@app.route('/finanzen/spende/neu', methods=['GET', 'POST'])
+def spende_neu():
+    """Neue Spende erfassen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    if request.method == 'POST':
+        # Spender prüfen/erstellen
+        spender_id = request.form.get('spender_id')
+        if not spender_id:
+            # Neuen Spender erstellen
+            spender = Spender(
+                anrede=request.form.get('anrede'),
+                vorname=request.form.get('vorname'),
+                nachname=request.form['nachname'],
+                organisation=request.form.get('organisation'),
+                strasse=request.form.get('strasse'),
+                plz=request.form.get('plz'),
+                ort=request.form.get('ort'),
+                email=request.form.get('email'),
+                telefon=request.form.get('telefon'),
+                dsgvo_zustimmung=True,
+                dsgvo_datum=datetime.datetime.utcnow()
+            )
+            db.session.add(spender)
+            db.session.flush()  # Um ID zu erhalten
+            spender_id = spender.id
+        
+        # Spende erstellen
+        betrag = Decimal(request.form['betrag'])
+        spende_datum = datetime.datetime.strptime(request.form['spende_datum'], '%Y-%m-%d').date()
+        zahlungsart = request.form['zahlungsart']
+        verwendungszweck = request.form.get('verwendungszweck', '')
+        projekt_id = request.form.get('projekt_id') or None
+        
+        spende = Spende(
+            spender_id=spender_id,
+            projekt_id=projekt_id,
+            betrag=betrag,
+            spende_datum=spende_datum,
+            zahlungsart=zahlungsart,
+            verwendungszweck=verwendungszweck
+        )
+        
+        db.session.add(spende)
+        db.session.commit()
+        
+        flash('Spende erfolgreich erfasst!', 'success')
+        return redirect(url_for('spenden_liste'))
+    
+    spender = Spender.query.all()
+    projekte = Projekt.query.filter_by(aktiv=True).all()
+    
+    return render_template('finanzen/spende_form.html',
+                         spender=spender,
+                         projekte=projekte)
+
+@app.route('/finanzen/spende/<int:spende_id>/quittung')
+def spenden_quittung_erstellen(spende_id):
+    """Spendenbescheinigung erstellen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    spende = Spende.query.get_or_404(spende_id)
+    
+    if not spende.quittungsnummer:
+        spende.quittungsnummer = generate_spenden_quittungsnummer()
+        spende.quittung_datum = datetime.date.today()
+        spende.quittung_erstellt = True
+        db.session.commit()
+    
+    # PDF generieren
+    pdf_pfad = erstelle_spenden_pdf(spende)
+    spende.quittung_pfad = pdf_pfad
+    db.session.commit()
+    
+    return send_file(pdf_pfad, as_attachment=True, 
+                    download_name=f"Spendenbescheinigung_{spende.quittungsnummer}.pdf")
+
+def erstelle_spenden_pdf(spende):
+    """Erstellt PDF für Spendenbescheinigung"""
+    filename = f"spendenbescheinigung_{spende.quittungsnummer}.pdf"
+    pdf_pfad = os.path.join(app.config['UPLOAD_FOLDER'], 'spenden', filename)
+    os.makedirs(os.path.dirname(pdf_pfad), exist_ok=True)
+    
+    doc = SimpleDocTemplate(pdf_pfad, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+    
+    # Header
+    header_style = ParagraphStyle(
+        'CustomHeader',
+        parent=styles['Heading1'],
+        fontSize=18,
+        spaceAfter=30,
+        alignment=1  # Center
+    )
+    
+    story.append(Paragraph("SPENDENBESCHEINIGUNG", header_style))
+    story.append(Spacer(1, 20))
+    
+    # Gemeinde-Info (hier sollten echte Daten stehen)
+    gemeinde_info = """
+    <b>Islamische Gemeinde Musterstadt e.V.</b><br/>
+    Musterstraße 123<br/>
+    12345 Musterstadt<br/>
+    Tel: 0123/456789<br/>
+    Steuernummer: 12/345/67890
+    """
+    story.append(Paragraph(gemeinde_info, styles['Normal']))
+    story.append(Spacer(1, 30))
+    
+    # Spender-Info
+    spender_info = f"""
+    <b>Spender:</b><br/>
+    {spende.spender.vollstaendiger_name}<br/>
+    {spende.spender.strasse}<br/>
+    {spende.spender.plz} {spende.spender.ort}
+    """
+    story.append(Paragraph(spender_info, styles['Normal']))
+    story.append(Spacer(1, 20))
+    
+    # Spenden-Details
+    spenden_data = [
+        ['Quittungsnummer:', spende.quittungsnummer],
+        ['Spendenbetrag:', f"{spende.betrag:.2f} €"],
+        ['Spendendatum:', spende.spende_datum.strftime('%d.%m.%Y')],
+        ['Verwendungszweck:', spende.verwendungszweck or 'Allgemeine Spende']
+    ]
+    
+    if spende.projekt:
+        spenden_data.append(['Projekt:', spende.projekt.name])
+    
+    spenden_table = Table(spenden_data, colWidths=[4*cm, 10*cm])
+    spenden_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+    ]))
+    
+    story.append(spenden_table)
+    story.append(Spacer(1, 30))
+    
+    # Bestätigung
+    bestaetigung = """
+    Hiermit wird bestätigt, dass die oben genannte Spende ausschließlich für 
+    gemeinnützige Zwecke im Sinne der Abgabenordnung verwendet wird.
+    """
+    story.append(Paragraph(bestaetigung, styles['Normal']))
+    story.append(Spacer(1, 30))
+    
+    # Unterschrift
+    datum_ort = f"Musterstadt, {datetime.date.today().strftime('%d.%m.%Y')}"
+    story.append(Paragraph(datum_ort, styles['Normal']))
+    story.append(Spacer(1, 40))
+    story.append(Paragraph("_" * 40, styles['Normal']))
+    story.append(Paragraph("Unterschrift Vorstand", styles['Normal']))
+    
+    doc.build(story)
+    return pdf_pfad
+
+# ===== RECHNUNGSSTELLUNG =====
+
+@app.route('/finanzen/rechnungen')
+def rechnungen_liste():
+    """Liste aller Rechnungen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    # Filter
+    seite = request.args.get('seite', 1, type=int)
+    status = request.args.get('status')
+    abteilung_id = request.args.get('abteilung_id', type=int)
+    
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        query = Rechnung.query
+    else:
+        query = Rechnung.query.filter_by(abteilung_id=benutzer.abteilung_id)
+    
+    if status:
+        query = query.filter_by(status=status)
+    
+    if abteilung_id:
+        query = query.filter_by(abteilung_id=abteilung_id)
+    
+    rechnungen = query.order_by(Rechnung.datum.desc()).paginate(
+        page=seite, per_page=50, error_out=False
+    )
+    
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        abteilungen = Abteilung.query.filter_by(aktiv=True).all()
+    else:
+        abteilungen = [benutzer.abteilung] if benutzer.abteilung else []
+    
+    return render_template('finanzen/rechnungen.html',
+                         rechnungen=rechnungen,
+                         abteilungen=abteilungen,
+                         benutzer=benutzer)
+
+@app.route('/finanzen/rechnung/neu', methods=['GET', 'POST'])
+def rechnung_neu():
+    """Neue Rechnung erstellen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    if request.method == 'POST':
+        # Rechnung erstellen
+        kunde_name = request.form['kunde_name']
+        kunde_strasse = request.form.get('kunde_strasse', '')
+        kunde_plz = request.form.get('kunde_plz', '')
+        kunde_ort = request.form.get('kunde_ort', '')
+        kunde_email = request.form.get('kunde_email', '')
+        
+        datum = datetime.datetime.strptime(request.form['datum'], '%Y-%m-%d').date()
+        zahlungsziel = int(request.form.get('zahlungsziel', 14))
+        faelligkeitsdatum = datum + datetime.timedelta(days=zahlungsziel)
+        
+        abteilung_id = request.form['abteilung_id']
+        verwendungszweck = request.form.get('verwendungszweck', '')
+        bemerkung = request.form.get('bemerkung', '')
+        
+        # Berechtigung prüfen
+        if benutzer.rolle not in ['admin', 'buchhalter']:
+            if int(abteilung_id) != benutzer.abteilung_id:
+                flash('Keine Berechtigung für diese Abteilung!', 'danger')
+                return redirect(url_for('rechnung_neu'))
+        
+        rechnung = Rechnung(
+            rechnungsnummer=generate_rechnungsnummer(),
+            datum=datum,
+            faelligkeitsdatum=faelligkeitsdatum,
+            kunde_name=kunde_name,
+            kunde_strasse=kunde_strasse,
+            kunde_plz=kunde_plz,
+            kunde_ort=kunde_ort,
+            kunde_email=kunde_email,
+            abteilung_id=abteilung_id,
+            verwendungszweck=verwendungszweck,
+            bemerkung=bemerkung,
+            netto_betrag=Decimal('0'),
+            mwst_betrag=Decimal('0'),
+            brutto_betrag=Decimal('0'),
+            erstellt_von=benutzer.id
+        )
+        
+        db.session.add(rechnung)
+        db.session.flush()  # Um ID zu erhalten
+        
+        # Positionen verarbeiten
+        positionen = request.form.getlist('positionen')
+        mengen = request.form.getlist('mengen')
+        einheiten = request.form.getlist('einheiten')
+        einzelpreise = request.form.getlist('einzelpreise')
+        mwst_saetze = request.form.getlist('mwst_saetze')
+        
+        netto_gesamt = Decimal('0')
+        mwst_gesamt = Decimal('0')
+        
+        for i, beschreibung in enumerate(positionen):
+            if beschreibung.strip():
+                menge = Decimal(mengen[i])
+                einzelpreis = Decimal(einzelpreise[i])
+                mwst_satz = Decimal(mwst_saetze[i])
+                
+                position = RechnungsPosition(
+                    rechnung_id=rechnung.id,
+                    position=i + 1,
+                    beschreibung=beschreibung,
+                    menge=menge,
+                    einheit=einheiten[i],
+                    einzelpreis=einzelpreis,
+                    mwst_satz=mwst_satz
+                )
+                
+                db.session.add(position)
+                
+                netto_gesamt += position.netto_betrag
+                mwst_gesamt += position.mwst_betrag
+        
+        # Rechnung aktualisieren
+        rechnung.netto_betrag = netto_gesamt
+        rechnung.mwst_betrag = mwst_gesamt
+        rechnung.brutto_betrag = netto_gesamt + mwst_gesamt
+        
+        db.session.commit()
+        
+        flash('Rechnung erfolgreich erstellt!', 'success')
+        return redirect(url_for('rechnungen_liste'))
+    
+    # Abteilungen laden
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        abteilungen = Abteilung.query.filter_by(aktiv=True).all()
+    else:
+        abteilungen = [benutzer.abteilung] if benutzer.abteilung else []
+    
+    return render_template('finanzen/rechnung_form.html',
+                         abteilungen=abteilungen,
+                         benutzer=benutzer)
+
+@app.route('/finanzen/rechnung/<int:rechnung_id>/pdf')
+def rechnung_pdf_erstellen(rechnung_id):
+    """Rechnung als PDF erstellen"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    rechnung = Rechnung.query.get_or_404(rechnung_id)
+    
+    # PDF generieren
+    pdf_pfad = erstelle_rechnungs_pdf(rechnung)
+    rechnung.pdf_pfad = pdf_pfad
+    db.session.commit()
+    
+    return send_file(pdf_pfad, as_attachment=True, 
+                    download_name=f"Rechnung_{rechnung.rechnungsnummer}.pdf")
+
+def erstelle_rechnungs_pdf(rechnung):
+    """Erstellt PDF für Rechnung"""
+    filename = f"rechnung_{rechnung.rechnungsnummer}.pdf"
+    pdf_pfad = os.path.join(app.config['UPLOAD_FOLDER'], 'rechnungen', filename)
+    os.makedirs(os.path.dirname(pdf_pfad), exist_ok=True)
+    
+    doc = SimpleDocTemplate(pdf_pfad, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+    
+    # Header mit Logo-Platzhalter
+    header_data = [
+        ["ISLAMISCHE GEMEINDE MUSTERSTADT E.V.", ""],
+        ["Musterstraße 123", f"Rechnung Nr.: {rechnung.rechnungsnummer}"],
+        ["12345 Musterstadt", f"Datum: {rechnung.datum.strftime('%d.%m.%Y')}"],
+        ["Tel: 0123/456789", f"Fällig: {rechnung.faelligkeitsdatum.strftime('%d.%m.%Y')}"]
+    ]
+    
+    header_table = Table(header_data, colWidths=[10*cm, 8*cm])
+    header_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('FONTNAME', (0, 0), (0, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ]))
+    
+    story.append(header_table)
+    story.append(Spacer(1, 30))
+    
+    # Kundenadresse
+    kunde_adresse = f"""
+    <b>{rechnung.kunde_name}</b><br/>
+    {rechnung.kunde_strasse}<br/>
+    {rechnung.kunde_plz} {rechnung.kunde_ort}
+    """
+    story.append(Paragraph(kunde_adresse, styles['Normal']))
+    story.append(Spacer(1, 30))
+    
+    # Rechnungspositionen
+    pos_data = [['Pos.', 'Beschreibung', 'Menge', 'Einheit', 'Einzelpreis', 'MwSt.', 'Betrag']]
+    
+    for position in rechnung.positionen:
+        pos_data.append([
+            str(position.position),
+            position.beschreibung,
+            f"{position.menge:.2f}",
+            position.einheit,
+            f"{position.einzelpreis:.2f} €",
+            f"{position.mwst_satz:.0f}%",
+            f"{position.brutto_betrag:.2f} €"
+        ])
+    
+    # Summen
+    pos_data.extend([
+        ['', '', '', '', '', 'Netto:', f"{rechnung.netto_betrag:.2f} €"],
+        ['', '', '', '', '', 'MwSt.:', f"{rechnung.mwst_betrag:.2f} €"],
+        ['', '', '', '', '', 'Gesamt:', f"{rechnung.brutto_betrag:.2f} €"]
+    ])
+    
+    pos_table = Table(pos_data, colWidths=[1*cm, 6*cm, 2*cm, 2*cm, 2.5*cm, 1.5*cm, 3*cm])
+    pos_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
+        ('GRID', (0, 0), (-1, -4), 1, colors.black),
+        ('LINEBELOW', (4, -3), (-1, -1), 1, colors.black),
+        ('FONTNAME', (5, -3), (-1, -1), 'Helvetica-Bold'),
+    ]))
+    
+    story.append(pos_table)
+    story.append(Spacer(1, 30))
+    
+    # Zahlungshinweise
+    if rechnung.verwendungszweck:
+        story.append(Paragraph(f"<b>Verwendungszweck:</b> {rechnung.verwendungszweck}", styles['Normal']))
+    
+    zahlungshinweis = """
+    <b>Zahlungshinweise:</b><br/>
+    Bitte überweisen Sie den Betrag bis zum Fälligkeitsdatum unter Angabe der Rechnungsnummer.
+    """
+    story.append(Paragraph(zahlungshinweis, styles['Normal']))
+    
+    if rechnung.bemerkung:
+        story.append(Spacer(1, 20))
+        story.append(Paragraph(f"<b>Bemerkung:</b> {rechnung.bemerkung}", styles['Normal']))
+    
+    doc.build(story)
+    return pdf_pfad
+
+# ===== BERICHTE UND AUSWERTUNGEN =====
+
+@app.route('/finanzen/berichte')
+def berichte_uebersicht():
+    """Übersicht der verfügbaren Berichte"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    return render_template('finanzen/berichte.html', benutzer=benutzer)
+
+@app.route('/finanzen/bericht/jahresabschluss')
+def jahresabschluss():
+    """Jahresabschluss-Bericht"""
+    if not session.get('benutzer_id'):
+        return redirect(url_for('finanzen_login'))
+    
+    benutzer = Benutzer.query.get(session['benutzer_id'])
+    
+    jahr = request.args.get('jahr', datetime.date.today().year, type=int)
+    abteilung_id = request.args.get('abteilung_id', type=int)
+    
+    jahr_start = datetime.date(jahr, 1, 1)
+    jahr_ende = datetime.date(jahr, 12, 31)
+    
+    # Abteilungen bestimmen
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        if abteilung_id:
+            abteilungen = [Abteilung.query.get(abteilung_id)]
+        else:
+            abteilungen = Abteilung.query.filter_by(aktiv=True).all()
+    else:
+        abteilungen = [benutzer.abteilung] if benutzer.abteilung else []
+    
+    # Berichte erstellen
+    abteilungs_berichte = []
+    gesamt_einnahmen = Decimal('0')
+    gesamt_ausgaben = Decimal('0')
+    
+    for abteilung in abteilungen:
+        saldo = berechne_abteilungs_saldo(abteilung.id, jahr_start, jahr_ende)
+        
+        # Monatliche Aufschlüsselung
+        monats_daten = []
+        for monat in range(1, 13):
+            monat_start = datetime.date(jahr, monat, 1)
+            if monat == 12:
+                monat_ende = datetime.date(jahr + 1, 1, 1) - datetime.timedelta(days=1)
+            else:
+                monat_ende = datetime.date(jahr, monat + 1, 1) - datetime.timedelta(days=1)
+            
+            monat_saldo = berechne_abteilungs_saldo(abteilung.id, monat_start, monat_ende)
+            monats_daten.append({
+                'monat': monat,
+                'monat_name': datetime.date(jahr, monat, 1).strftime('%B'),
+                'einnahmen': monat_saldo['einnahmen'],
+                'ausgaben': monat_saldo['ausgaben'],
+                'saldo': monat_saldo['saldo']
+            })
+        
+        abteilungs_berichte.append({
+            'abteilung': abteilung,
+            'einnahmen': saldo['einnahmen'],
+            'ausgaben': saldo['ausgaben'],
+            'saldo': saldo['saldo'],
+            'monate': monats_daten
+        })
+        
+        gesamt_einnahmen += saldo['einnahmen']
+        gesamt_ausgaben += saldo['ausgaben']
+    
+    # Verfügbare Abteilungen für Filter
+    if benutzer.rolle in ['admin', 'buchhalter']:
+        alle_abteilungen = Abteilung.query.filter_by(aktiv=True).all()
+    else:
+        alle_abteilungen = [benutzer.abteilung] if benutzer.abteilung else []
+    
+    return render_template('finanzen/jahresabschluss.html',
+                         abteilungs_berichte=abteilungs_berichte,
+                         jahr=jahr,
+                         gesamt_einnahmen=gesamt_einnahmen,
+                         gesamt_ausgaben=gesamt_ausgaben,
+                         gesamt_saldo=gesamt_einnahmen - gesamt_ausgaben,
+                         alle_abteilungen=alle_abteilungen,
+                         ausgewaehlte_abteilung=abteilung_id,
+                         benutzer=benutzer)
 
 # === Vertretungsplan ===
 
